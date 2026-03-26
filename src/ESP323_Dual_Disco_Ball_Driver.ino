@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <Preferences.h>
 #include <SimpleFOC.h>
 #include <WiFi.h>
@@ -26,7 +28,16 @@ static constexpr int VIN_SENSE = 13;
 
 static constexpr uint32_t MOTOR_TASK_IDLE_DELAY_MS = 1;
 static constexpr uint32_t MOTOR_TASK_BUSY_YIELD_INTERVAL = 128;
+static constexpr uint32_t NETWORK_TASK_INTERVAL_MS = 2;
 static constexpr uint32_t BOARD_CHECK_INTERVAL_MS = 1000;
+
+#if CONFIG_FREERTOS_UNICORE
+static constexpr BaseType_t NETWORK_TASK_CORE = 0;
+static constexpr BaseType_t MOTOR_TASK_CORE = 0;
+#else
+static constexpr BaseType_t NETWORK_TASK_CORE = 0;
+static constexpr BaseType_t MOTOR_TASK_CORE = 1;
+#endif
 
 const MotorTopicInfo MOTOR_TOPICS[MOTOR_COUNT] = {
   {
@@ -77,7 +88,8 @@ volatile bool mqttReconnectRequested = false;
 uint32_t wifiConnectStartedMs = 0;
 uint32_t lastWifiRetryMs = 0;
 uint32_t lastStatusPublishMs = 0;
-uint32_t mainLoopBusyYieldCounter = 0;
+TaskHandle_t motorTaskHandle = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
 char uiMessage[MAX_UI_MESSAGE_LENGTH] = "Web UI ready.";
 
 bool equalsIgnoreCase(const char *lhs, const char *rhs) {
@@ -1172,7 +1184,8 @@ void printTopicHelp() {
 void printStartupBanner() {
   Serial.println();
   Serial.println("ESP32 dual motor MQTT controller");
-  Serial.printf("Arduino loop core: %d\n", ARDUINO_RUNNING_CORE);
+  Serial.printf("Arduino setup/loop core: %d\n", ARDUINO_RUNNING_CORE);
+  Serial.printf("Motor task core: %d, network task core: %d\n", MOTOR_TASK_CORE, NETWORK_TASK_CORE);
 }
 
 void initializeApplication() {
@@ -1185,28 +1198,79 @@ void initializeApplication() {
   restartMqttClient();
   lastWifiRetryMs = millis();
   lastStatusPublishMs = millis();
-
-  Serial.println("Single-loop runtime started");
 }
 
-void yieldForMotorLoop() {
+void serviceMotorTask() {
+  static uint32_t motorTaskBusyYieldCounter = 0;
+
+  serviceMotorControl();
+
   if (!driverOutputsEnabled) {
-    mainLoopBusyYieldCounter = 0;
-    delay(MOTOR_TASK_IDLE_DELAY_MS);
+    motorTaskBusyYieldCounter = 0;
+    vTaskDelay(pdMS_TO_TICKS(MOTOR_TASK_IDLE_DELAY_MS));
     return;
   }
 
-  ++mainLoopBusyYieldCounter;
-  if (mainLoopBusyYieldCounter >= MOTOR_TASK_BUSY_YIELD_INTERVAL) {
-    mainLoopBusyYieldCounter = 0;
-    delay(0);
+  ++motorTaskBusyYieldCounter;
+  if (motorTaskBusyYieldCounter >= MOTOR_TASK_BUSY_YIELD_INTERVAL) {
+    motorTaskBusyYieldCounter = 0;
+    taskYIELD();
   }
 }
 
-void runApplicationLoop() {
-  serviceMotorControl();
+void serviceNetworkTask() {
   serviceNetwork();
-  yieldForMotorLoop();
+  vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_INTERVAL_MS));
+}
+
+void motorTaskEntry(void *parameter) {
+  (void)parameter;
+  Serial.printf("[task] motor task started on core %d\n", xPortGetCoreID());
+  for (;;) {
+    serviceMotorTask();
+  }
+}
+
+void networkTaskEntry(void *parameter) {
+  (void)parameter;
+  Serial.printf("[task] network task started on core %d\n", xPortGetCoreID());
+  for (;;) {
+    serviceNetworkTask();
+  }
+}
+
+void startBackgroundTasks() {
+  if (motorTaskHandle == nullptr) {
+    const BaseType_t result = xTaskCreatePinnedToCore(
+      motorTaskEntry,
+      "motorTask",
+      8192,
+      nullptr,
+      3,
+      &motorTaskHandle,
+      MOTOR_TASK_CORE);
+    if (result != pdPASS) {
+      Serial.println("[task] failed to start motor task");
+    }
+  }
+
+  if (networkTaskHandle == nullptr) {
+    const BaseType_t result = xTaskCreatePinnedToCore(
+      networkTaskEntry,
+      "networkTask",
+      6144,
+      nullptr,
+      2,
+      &networkTaskHandle,
+      NETWORK_TASK_CORE);
+    if (result != pdPASS) {
+      Serial.println("[task] failed to start network task");
+    }
+  }
+
+  if (motorTaskHandle != nullptr && networkTaskHandle != nullptr) {
+    Serial.println("Dual-task runtime started");
+  }
 }
 
 void setup() {
@@ -1216,8 +1280,9 @@ void setup() {
 
   printStartupBanner();
   initializeApplication();
+  startBackgroundTasks();
 }
 
 void loop() {
-  runApplicationLoop();
+  delay(1000);
 }
