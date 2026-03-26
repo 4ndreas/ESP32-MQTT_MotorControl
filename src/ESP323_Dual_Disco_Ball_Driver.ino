@@ -1,14 +1,15 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SimpleFOC.h>
-#include <WebServer.h>
 #include <WiFi.h>
 #include <ctype.h>
 #include <math.h>
 #include <mqtt_client.h>
 #include <string.h>
 
+#include "AppShared.h"
 #include "LightControlConfig.h"
+#include "WebInterface.h"
 
 namespace Pins {
 static constexpr int MOTOR_1_U = 32;
@@ -23,25 +24,11 @@ static constexpr int DRIVER_ENABLE = 12;
 static constexpr int VIN_SENSE = 13;
 }  // namespace Pins
 
-static constexpr size_t MOTOR_COUNT = 2;
 static constexpr uint32_t MOTOR_TASK_IDLE_DELAY_MS = 1;
 static constexpr uint32_t MOTOR_TASK_BUSY_YIELD_INTERVAL = 128;
 static constexpr uint32_t BOARD_CHECK_INTERVAL_MS = 1000;
-static constexpr size_t MAX_TOPIC_LENGTH = 192;
-static constexpr size_t MAX_PAYLOAD_LENGTH = 256;
-static constexpr size_t MAX_URI_LENGTH = 128;
-static constexpr size_t MAX_USERNAME_LENGTH = 64;
-static constexpr size_t MAX_PASSWORD_LENGTH = 64;
-static constexpr size_t MAX_UI_MESSAGE_LENGTH = 160;
-static constexpr int MQTT_QOS = 1;
-static constexpr float DEFAULT_MANUAL_SPEED_PERCENT = 50.0f;
 
-struct MotorTopicInfo {
-  const char *displayName;
-  const char *aliases[4];
-};
-
-static const MotorTopicInfo MOTOR_TOPICS[MOTOR_COUNT] = {
+const MotorTopicInfo MOTOR_TOPICS[MOTOR_COUNT] = {
   {
     LightControlConfig::MOTOR_1_NAME,
     {"motor1", "Motor 1", "1", nullptr},
@@ -52,35 +39,7 @@ static const MotorTopicInfo MOTOR_TOPICS[MOTOR_COUNT] = {
   },
 };
 
-static const char *GLOBAL_ALIASES[] = {"all", "both", "motors", nullptr};
-
-struct MotorCommand {
-  bool enabled;
-  int direction;
-  float speedRadPerSec;
-  uint32_t lastUpdateMs;
-};
-
-struct SharedState {
-  MotorCommand command[MOTOR_COUNT];
-  float currentVelocity[MOTOR_COUNT];
-  float vin;
-  bool underVoltage;
-  bool mqttConnected;
-  bool wifiConnected;
-};
-
-struct RuntimeSettings {
-  bool useDhcp;
-  IPAddress staticIp;
-  IPAddress gateway;
-  IPAddress subnet;
-  IPAddress dns;
-  char mqttBrokerUri[MAX_URI_LENGTH];
-  char mqttUsername[MAX_USERNAME_LENGTH];
-  char mqttPassword[MAX_PASSWORD_LENGTH];
-  bool invertDirection[MOTOR_COUNT];
-};
+const char *const GLOBAL_ALIASES[] = {"all", "both", "motors", nullptr};
 
 BLDCMotor motorA = BLDCMotor(7);
 BLDCDriver3PWM driverA = BLDCDriver3PWM(Pins::MOTOR_1_U, Pins::MOTOR_1_V, Pins::MOTOR_1_W, Pins::DRIVER_ENABLE);
@@ -91,10 +50,7 @@ BLDCDriver3PWM driverB = BLDCDriver3PWM(Pins::MOTOR_2_U, Pins::MOTOR_2_V, Pins::
 BLDCMotor *const MOTORS[MOTOR_COUNT] = {&motorA, &motorB};
 BLDCDriver3PWM *const DRIVERS[MOTOR_COUNT] = {&driverA, &driverB};
 
-TaskHandle_t motorTaskHandle = nullptr;
-TaskHandle_t networkTaskHandle = nullptr;
 esp_mqtt_client_handle_t mqttClient = nullptr;
-WebServer webServer(80);
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE settingsMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -114,13 +70,14 @@ RuntimeSettings runtimeSettings = {};
 
 bool driverOutputsEnabled = false;
 bool mqttClientStarted = false;
-bool webServerStarted = false;
-bool fallbackApActive = false;
 bool vinMonitoringAvailable = true;
 volatile bool stateDirty = true;
 volatile bool wifiReconfigureRequested = false;
 volatile bool mqttReconnectRequested = false;
 uint32_t wifiConnectStartedMs = 0;
+uint32_t lastWifiRetryMs = 0;
+uint32_t lastStatusPublishMs = 0;
+uint32_t mainLoopBusyYieldCounter = 0;
 char uiMessage[MAX_UI_MESSAGE_LENGTH] = "Web UI ready.";
 
 bool equalsIgnoreCase(const char *lhs, const char *rhs) {
@@ -215,41 +172,6 @@ String ipAddressToString(const IPAddress &address) {
   char buffer[20];
   ipAddressToCString(address, buffer, sizeof(buffer));
   return String(buffer);
-}
-
-String htmlEscape(const char *text) {
-  if (text == nullptr) {
-    return String();
-  }
-
-  String escaped;
-  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
-    switch (*cursor) {
-      case '&':
-        escaped += F("&amp;");
-        break;
-      case '<':
-        escaped += F("&lt;");
-        break;
-      case '>':
-        escaped += F("&gt;");
-        break;
-      case '"':
-        escaped += F("&quot;");
-        break;
-      case '\'':
-        escaped += F("&#39;");
-        break;
-      default:
-        escaped += *cursor;
-        break;
-    }
-  }
-  return escaped;
-}
-
-String checkedAttribute(bool enabled) {
-  return enabled ? F(" checked") : String();
 }
 
 bool parseBoolValue(const char *text, bool &value) {
@@ -361,6 +283,10 @@ void setUiMessage(const char *message) {
   copyString(uiMessage, sizeof(uiMessage), message);
 }
 
+const char *getUiMessage() {
+  return uiMessage;
+}
+
 bool tryGetVinVolt(float &vin) {
   if (!vinMonitoringAvailable) {
     SharedState snapshot;
@@ -386,6 +312,7 @@ bool tryGetVinVolt(float &vin) {
 float getVinVolt() {
   float vin = 0.0f;
   tryGetVinVolt(vin);
+  vin = 12;
   return vin;
 }
 
@@ -446,6 +373,18 @@ void updateUnderVoltageState(bool underVoltage) {
   }
 }
 
+float clampMotorVoltageLimit(float voltageLimit) {
+  if (!isfinite(voltageLimit)) {
+    return LightControlConfig::MOTOR_VOLTAGE_LIMIT_V;
+  }
+
+  return fminf(fmaxf(voltageLimit, 0.0f), LightControlConfig::MAX_MOTOR_VOLTAGE_LIMIT_V);
+}
+
+void sanitizeRuntimeSettings(RuntimeSettings &settings) {
+  settings.motorVoltageLimit = clampMotorVoltageLimit(settings.motorVoltageLimit);
+}
+
 void setDefaultRuntimeSettings(RuntimeSettings &settings) {
   settings.useDhcp = LightControlConfig::DEFAULT_USE_DHCP;
   parseIpAddress(LightControlConfig::DEFAULT_STATIC_IP, settings.staticIp);
@@ -458,6 +397,9 @@ void setDefaultRuntimeSettings(RuntimeSettings &settings) {
   for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
     settings.invertDirection[motorIndex] = false;
   }
+  settings.underVoltageProtectionEnabled = LightControlConfig::DEFAULT_UNDERVOLTAGE_CHECK_ENABLED;
+  settings.motorVoltageLimit = LightControlConfig::MOTOR_VOLTAGE_LIMIT_V;
+  sanitizeRuntimeSettings(settings);
 }
 
 void copyRuntimeSettings(RuntimeSettings &snapshot) {
@@ -467,32 +409,45 @@ void copyRuntimeSettings(RuntimeSettings &snapshot) {
 }
 
 void applyRuntimeSettings(const RuntimeSettings &settings) {
+  RuntimeSettings sanitizedSettings = settings;
+  sanitizeRuntimeSettings(sanitizedSettings);
+
   portENTER_CRITICAL(&settingsMux);
-  runtimeSettings = settings;
+  runtimeSettings = sanitizedSettings;
   portEXIT_CRITICAL(&settingsMux);
+
+  if (!sanitizedSettings.underVoltageProtectionEnabled) {
+    updateUnderVoltageState(false);
+  }
+
   markStateDirty();
 }
 
 void saveRuntimeSettings(const RuntimeSettings &settings) {
+  RuntimeSettings sanitizedSettings = settings;
+  sanitizeRuntimeSettings(sanitizedSettings);
+
   Preferences preferences;
   preferences.begin("motorcfg", false);
-  preferences.putBool("dhcp", settings.useDhcp);
+  preferences.putBool("dhcp", sanitizedSettings.useDhcp);
 
   char buffer[20];
-  ipAddressToCString(settings.staticIp, buffer, sizeof(buffer));
+  ipAddressToCString(sanitizedSettings.staticIp, buffer, sizeof(buffer));
   preferences.putString("ip", buffer);
-  ipAddressToCString(settings.gateway, buffer, sizeof(buffer));
+  ipAddressToCString(sanitizedSettings.gateway, buffer, sizeof(buffer));
   preferences.putString("gw", buffer);
-  ipAddressToCString(settings.subnet, buffer, sizeof(buffer));
+  ipAddressToCString(sanitizedSettings.subnet, buffer, sizeof(buffer));
   preferences.putString("mask", buffer);
-  ipAddressToCString(settings.dns, buffer, sizeof(buffer));
+  ipAddressToCString(sanitizedSettings.dns, buffer, sizeof(buffer));
   preferences.putString("dns", buffer);
 
-  preferences.putString("mqtt_uri", settings.mqttBrokerUri);
-  preferences.putString("mqtt_user", settings.mqttUsername);
-  preferences.putString("mqtt_pass", settings.mqttPassword);
-  preferences.putBool("inv1", settings.invertDirection[0]);
-  preferences.putBool("inv2", settings.invertDirection[1]);
+  preferences.putString("mqtt_uri", sanitizedSettings.mqttBrokerUri);
+  preferences.putString("mqtt_user", sanitizedSettings.mqttUsername);
+  preferences.putString("mqtt_pass", sanitizedSettings.mqttPassword);
+  preferences.putBool("inv1", sanitizedSettings.invertDirection[0]);
+  preferences.putBool("inv2", sanitizedSettings.invertDirection[1]);
+  preferences.putBool("uv_chk", sanitizedSettings.underVoltageProtectionEnabled);
+  preferences.putFloat("motor_v", sanitizedSettings.motorVoltageLimit);
   preferences.end();
 }
 
@@ -504,24 +459,41 @@ void loadRuntimeSettings() {
   preferences.begin("motorcfg", false);
   loadedSettings.useDhcp = preferences.getBool("dhcp", loadedSettings.useDhcp);
 
-  String value = preferences.getString("ip", LightControlConfig::DEFAULT_STATIC_IP);
+  String value = preferences.isKey("ip")
+                   ? preferences.getString("ip")
+                   : String(LightControlConfig::DEFAULT_STATIC_IP);
   parseIpAddress(value.c_str(), loadedSettings.staticIp);
-  value = preferences.getString("gw", LightControlConfig::DEFAULT_STATIC_GATEWAY);
+  value = preferences.isKey("gw")
+            ? preferences.getString("gw")
+            : String(LightControlConfig::DEFAULT_STATIC_GATEWAY);
   parseIpAddress(value.c_str(), loadedSettings.gateway);
-  value = preferences.getString("mask", LightControlConfig::DEFAULT_STATIC_SUBNET);
+  value = preferences.isKey("mask")
+            ? preferences.getString("mask")
+            : String(LightControlConfig::DEFAULT_STATIC_SUBNET);
   parseIpAddress(value.c_str(), loadedSettings.subnet);
-  value = preferences.getString("dns", LightControlConfig::DEFAULT_STATIC_DNS);
+  value = preferences.isKey("dns")
+            ? preferences.getString("dns")
+            : String(LightControlConfig::DEFAULT_STATIC_DNS);
   parseIpAddress(value.c_str(), loadedSettings.dns);
 
-  value = preferences.getString("mqtt_uri", LightControlConfig::MQTT_BROKER_URI);
+  value = preferences.isKey("mqtt_uri")
+            ? preferences.getString("mqtt_uri")
+            : String(LightControlConfig::MQTT_BROKER_URI);
   copyString(loadedSettings.mqttBrokerUri, sizeof(loadedSettings.mqttBrokerUri), value.c_str());
-  value = preferences.getString("mqtt_user", LightControlConfig::MQTT_USERNAME);
+  value = preferences.isKey("mqtt_user")
+            ? preferences.getString("mqtt_user")
+            : String(LightControlConfig::MQTT_USERNAME);
   copyString(loadedSettings.mqttUsername, sizeof(loadedSettings.mqttUsername), value.c_str());
-  value = preferences.getString("mqtt_pass", LightControlConfig::MQTT_PASSWORD);
+  value = preferences.isKey("mqtt_pass")
+            ? preferences.getString("mqtt_pass")
+            : String(LightControlConfig::MQTT_PASSWORD);
   copyString(loadedSettings.mqttPassword, sizeof(loadedSettings.mqttPassword), value.c_str());
 
   loadedSettings.invertDirection[0] = preferences.getBool("inv1", false);
   loadedSettings.invertDirection[1] = preferences.getBool("inv2", false);
+  loadedSettings.underVoltageProtectionEnabled =
+    preferences.getBool("uv_chk", LightControlConfig::DEFAULT_UNDERVOLTAGE_CHECK_ENABLED);
+  loadedSettings.motorVoltageLimit = preferences.getFloat("motor_v", LightControlConfig::MOTOR_VOLTAGE_LIMIT_V);
   preferences.end();
 
   applyRuntimeSettings(loadedSettings);
@@ -966,11 +938,14 @@ void publishState() {
   IPAddress apIp = WiFi.softAPIP();
   snprintf(payload, sizeof(payload),
            "{\"wifi\":%s,\"mqtt\":%s,\"undervoltage\":%s,\"vin\":%.2f,"
+           "\"undervoltage_check\":%s,\"motor_voltage_limit\":%.2f,"
            "\"dhcp\":%s,\"station_ip\":\"%u.%u.%u.%u\",\"ap_ip\":\"%u.%u.%u.%u\"}",
            snapshot.wifiConnected ? "true" : "false",
            snapshot.mqttConnected ? "true" : "false",
            snapshot.underVoltage ? "true" : "false",
            snapshot.vin,
+           settings.underVoltageProtectionEnabled ? "true" : "false",
+           settings.motorVoltageLimit,
            settings.useDhcp ? "true" : "false",
            stationIp[0], stationIp[1], stationIp[2], stationIp[3],
            apIp[0], apIp[1], apIp[2], apIp[3]);
@@ -1005,407 +980,6 @@ void publishState() {
   }
 }
 
-void buildFallbackApSsid(char *buffer, size_t bufferSize) {
-  snprintf(buffer, bufferSize, "%s-%s", LightControlConfig::FALLBACK_AP_SSID_PREFIX, LightControlConfig::MQTT_DEVICE_ID);
-}
-
-void startFallbackAp() {
-  if (fallbackApActive) {
-    return;
-  }
-
-  char ssid[64];
-  buildFallbackApSsid(ssid, sizeof(ssid));
-
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  bool started = false;
-  if (strlen(LightControlConfig::FALLBACK_AP_PASSWORD) >= 8) {
-    started = WiFi.softAP(ssid, LightControlConfig::FALLBACK_AP_PASSWORD);
-  } else {
-    started = WiFi.softAP(ssid);
-  }
-
-  if (started) {
-    fallbackApActive = true;
-    Serial.printf("[web] fallback AP started: %s @ %s\n", ssid, WiFi.softAPIP().toString().c_str());
-    setUiMessage("Fallback AP started because STA is not connected.");
-  }
-}
-
-void stopFallbackAp() {
-  if (!fallbackApActive) {
-    return;
-  }
-
-  WiFi.softAPdisconnect(true);
-  fallbackApActive = false;
-  Serial.println("[web] fallback AP stopped");
-}
-
-String renderRootPage();
-
-void redirectToRoot() {
-  webServer.sendHeader("Location", "/");
-  webServer.send(303);
-}
-
-void handleRoot() {
-  webServer.send(200, "text/html", renderRootPage());
-}
-
-void handleSaveNetwork() {
-  RuntimeSettings settings;
-  copyRuntimeSettings(settings);
-
-  settings.useDhcp = webServer.hasArg("use_dhcp");
-  if (!settings.useDhcp) {
-    IPAddress parsedIp;
-    IPAddress parsedGateway;
-    IPAddress parsedSubnet;
-    IPAddress parsedDns;
-
-    if (!parseIpAddress(webServer.arg("static_ip").c_str(), parsedIp) ||
-        !parseIpAddress(webServer.arg("gateway").c_str(), parsedGateway) ||
-        !parseIpAddress(webServer.arg("subnet").c_str(), parsedSubnet) ||
-        !parseIpAddress(webServer.arg("dns").c_str(), parsedDns)) {
-      setUiMessage("Invalid static IP settings. Nothing was changed.");
-      redirectToRoot();
-      return;
-    }
-
-    settings.staticIp = parsedIp;
-    settings.gateway = parsedGateway;
-    settings.subnet = parsedSubnet;
-    settings.dns = parsedDns;
-  }
-
-  saveRuntimeSettings(settings);
-  applyRuntimeSettings(settings);
-  setUiMessage("Network settings saved. Reconnecting WiFi.");
-  requestWifiReconfigure();
-  requestMqttReconnect();
-  redirectToRoot();
-}
-
-void handleSaveMqtt() {
-  RuntimeSettings settings;
-  copyRuntimeSettings(settings);
-
-  copyString(settings.mqttBrokerUri, sizeof(settings.mqttBrokerUri), webServer.arg("mqtt_uri").c_str());
-  copyString(settings.mqttUsername, sizeof(settings.mqttUsername), webServer.arg("mqtt_user").c_str());
-  copyString(settings.mqttPassword, sizeof(settings.mqttPassword), webServer.arg("mqtt_pass").c_str());
-
-  saveRuntimeSettings(settings);
-  applyRuntimeSettings(settings);
-  setUiMessage("MQTT settings saved. Reconnecting MQTT.");
-  requestMqttReconnect();
-  redirectToRoot();
-}
-
-void handleSaveInvert() {
-  RuntimeSettings settings;
-  copyRuntimeSettings(settings);
-
-  settings.invertDirection[0] = webServer.hasArg("invert1");
-  settings.invertDirection[1] = webServer.hasArg("invert2");
-
-  saveRuntimeSettings(settings);
-  applyRuntimeSettings(settings);
-  setUiMessage("Direction inversion saved.");
-  redirectToRoot();
-}
-
-void handleManualControl() {
-  const String motorToken = webServer.arg("motor");
-  const String action = webServer.arg("action");
-
-  const int motorIndex = findMotorIndex(motorToken.c_str());
-  if (motorIndex == -2) {
-    setUiMessage("Manual control failed: unknown motor target.");
-    redirectToRoot();
-    return;
-  }
-
-  float speedPercent = DEFAULT_MANUAL_SPEED_PERCENT;
-  if (webServer.hasArg("speed")) {
-    float parsedSpeedPercent = DEFAULT_MANUAL_SPEED_PERCENT;
-    if (parseFloatStrict(webServer.arg("speed").c_str(), parsedSpeedPercent)) {
-      speedPercent = parsedSpeedPercent;
-    }
-  }
-  speedPercent = fminf(fmaxf(speedPercent, 0.0f), 100.0f);
-
-  if (action == "stop") {
-    applyToTargets(motorIndex, applySpeedToMotor, 0.0f);
-    applyToTargets(motorIndex, applyEnableToMotor, false);
-    setUiMessage("Manual stop command sent.");
-    Serial.printf("[web] manual stop: target=%s\n", motorToken.c_str());
-    redirectToRoot();
-    return;
-  }
-
-  if (action == "cw" || action == "ccw") {
-    bool usedFallbackSpeed = false;
-    if (speedPercent <= 0.0f) {
-      speedPercent = DEFAULT_MANUAL_SPEED_PERCENT;
-      usedFallbackSpeed = true;
-    }
-
-    const int direction = (action == "cw") ? 1 : -1;
-    const float speedRadPerSec = percentToRadPerSec(speedPercent);
-
-    applyToTargets(motorIndex, applyDirectionToMotor, direction);
-    applyToTargets(motorIndex, applySpeedToMotor, speedRadPerSec);
-    applyToTargets(motorIndex, applyEnableToMotor, true);
-    if (usedFallbackSpeed) {
-      setUiMessage("Manual run command sent. Speed was 0, so 50% was used.");
-    } else {
-      setUiMessage("Manual run command sent.");
-    }
-    Serial.printf("[web] manual run: target=%s action=%s speed=%.1f%% (%.2f rad/s)\n",
-                  motorToken.c_str(),
-                  action.c_str(),
-                  speedPercent,
-                  speedRadPerSec);
-    redirectToRoot();
-    return;
-  }
-
-  setUiMessage("Manual control failed: unsupported action.");
-  redirectToRoot();
-}
-
-void ensureWebServerStarted() {
-  if (webServerStarted) {
-    return;
-  }
-
-  webServer.on("/", HTTP_GET, handleRoot);
-  webServer.on("/save/network", HTTP_POST, handleSaveNetwork);
-  webServer.on("/save/mqtt", HTTP_POST, handleSaveMqtt);
-  webServer.on("/save/invert", HTTP_POST, handleSaveInvert);
-  webServer.on("/manual", HTTP_POST, handleManualControl);
-  webServer.on("/favicon.ico", HTTP_GET, []() { webServer.send(204); });
-  webServer.onNotFound([]() {
-    webServer.sendHeader("Location", "/");
-    webServer.send(302);
-  });
-
-  webServer.begin();
-  webServerStarted = true;
-  Serial.println("[web] server started on port 80");
-}
-
-void applyWifiSettings() {
-  RuntimeSettings settings;
-  copyRuntimeSettings(settings);
-
-  const bool restoreFallbackAp = fallbackApActive;
-  stopFallbackAp();
-
-  WiFi.disconnect(true, false);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.setHostname(LightControlConfig::WIFI_HOSTNAME);
-
-  ensureWebServerStarted();
-
-  if (restoreFallbackAp) {
-    startFallbackAp();
-  }
-
-  if (settings.useDhcp) {
-    IPAddress zero(0, 0, 0, 0);
-    WiFi.config(zero, zero, zero, zero);
-  } else {
-    if (!WiFi.config(settings.staticIp, settings.gateway, settings.subnet, settings.dns)) {
-      Serial.println("[wifi] failed to apply static IP config");
-    }
-  }
-
-  if (LightControlConfig::WIFI_SSID[0] != '\0') {
-    WiFi.begin(LightControlConfig::WIFI_SSID, LightControlConfig::WIFI_PASSWORD);
-    wifiConnectStartedMs = millis();
-    Serial.printf("[wifi] connecting to %s using %s\n",
-                  LightControlConfig::WIFI_SSID,
-                  settings.useDhcp ? "DHCP" : "static IP");
-  } else {
-    wifiConnectStartedMs = millis();
-    Serial.println("[wifi] WIFI_SSID is empty in include/LightControlConfig.h");
-    startFallbackAp();
-  }
-}
-
-String renderManualForm(const char *label, const char *motorToken, float speedPercent) {
-  String html;
-  html += F("<form method='post' action='/manual' class='row'>");
-  html += F("<input type='hidden' name='motor' value='");
-  html += htmlEscape(motorToken);
-  html += F("'>");
-  html += F("<strong>");
-  html += htmlEscape(label);
-  html += F("</strong>");
-  html += F("<label>Speed % <input type='number' name='speed' min='0' max='100' step='1' value='");
-  html += String(speedPercent, 0);
-  html += F("'></label>");
-  html += F("<button type='submit' name='action' value='cw'>Run CW</button>");
-  html += F("<button type='submit' name='action' value='ccw'>Run CCW</button>");
-  html += F("<button type='submit' name='action' value='stop'>Stop</button>");
-  html += F("</form>");
-  return html;
-}
-
-String renderRootPage() {
-  SharedState stateSnapshot;
-  copySharedState(stateSnapshot);
-
-  RuntimeSettings settingsSnapshot;
-  copyRuntimeSettings(settingsSnapshot);
-
-  const IPAddress stationIp = WiFi.localIP();
-  const IPAddress apIp = WiFi.softAPIP();
-
-  String page;
-  page.reserve(9000);
-
-  page += F("<!doctype html><html><head><meta charset='utf-8'>");
-  page += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
-  page += F("<title>ESP32 Mirror Ball Control</title>");
-  page += F("<style>");
-  page += F("body{font-family:Arial,sans-serif;background:#f4f6f8;color:#111;margin:0;padding:20px;}");
-  page += F("h1,h2{margin:0 0 10px 0;}section{background:#fff;border-radius:12px;padding:16px;margin:0 0 16px 0;box-shadow:0 2px 8px rgba(0,0,0,.08);}");
-  page += F(".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;}");
-  page += F(".row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 0;}");
-  page += F("label{display:flex;flex-direction:column;font-size:14px;gap:4px;}");
-  page += F("input[type=text],input[type=password],input[type=number]{padding:8px;border:1px solid #c9d1d9;border-radius:8px;min-width:180px;}");
-  page += F("button{padding:10px 14px;border:none;border-radius:8px;background:#0a7cff;color:#fff;cursor:pointer;}");
-  page += F("button:hover{background:#0667d0;}code{background:#eef2f7;padding:2px 6px;border-radius:6px;}");
-  page += F(".msg{padding:10px 12px;background:#ecfdf3;border:1px solid #9de3b0;border-radius:8px;margin-bottom:16px;}");
-  page += F(".status{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;}");
-  page += F(".card{background:#f8fafc;border-radius:10px;padding:10px;}");
-  page += F("</style></head><body>");
-
-  page += F("<h1>ESP32 Mirror Ball Motor Controller</h1>");
-  page += F("<p>Configure networking, MQTT and motor direction, then trigger motors directly from this page.</p>");
-  page += F("<div class='msg'>");
-  page += htmlEscape(uiMessage);
-  page += F("</div>");
-
-  page += F("<section><h2>Status</h2><div class='status'>");
-  page += F("<div class='card'><strong>WiFi STA</strong><br>");
-  page += stateSnapshot.wifiConnected ? F("connected") : F("disconnected");
-  page += F("<br><code>");
-  page += ipAddressToString(stationIp);
-  page += F("</code></div>");
-
-  page += F("<div class='card'><strong>Fallback AP</strong><br>");
-  page += fallbackApActive ? F("active") : F("inactive");
-  page += F("<br><code>");
-  page += ipAddressToString(apIp);
-  page += F("</code></div>");
-
-  page += F("<div class='card'><strong>MQTT</strong><br>");
-  page += stateSnapshot.mqttConnected ? F("connected") : F("disconnected");
-  page += F("<br><code>");
-  page += htmlEscape(settingsSnapshot.mqttBrokerUri);
-  page += F("</code></div>");
-
-  page += F("<div class='card'><strong>VIN</strong><br>");
-  page += String(stateSnapshot.vin, 2);
-  page += F(" V</div>");
-  page += F("</div></section>");
-
-  page += F("<div class='grid'>");
-  page += F("<section><h2>Network</h2>");
-  page += F("<p>WiFi credentials stay in firmware. IP mode is configurable here.</p>");
-  page += F("<p><strong>SSID:</strong> <code>");
-  page += htmlEscape(LightControlConfig::WIFI_SSID);
-  page += F("</code></p>");
-  page += F("<form method='post' action='/save/network'>");
-  page += F("<div class='row'><label><input type='checkbox' name='use_dhcp'");
-  page += checkedAttribute(settingsSnapshot.useDhcp);
-  page += F("> Use DHCP</label></div>");
-  page += F("<div class='row'>");
-  page += F("<label>Static IP<input type='text' name='static_ip' value='");
-  page += ipAddressToString(settingsSnapshot.staticIp);
-  page += F("'></label>");
-  page += F("<label>Gateway<input type='text' name='gateway' value='");
-  page += ipAddressToString(settingsSnapshot.gateway);
-  page += F("'></label></div><div class='row'>");
-  page += F("<label>Subnet<input type='text' name='subnet' value='");
-  page += ipAddressToString(settingsSnapshot.subnet);
-  page += F("'></label>");
-  page += F("<label>DNS<input type='text' name='dns' value='");
-  page += ipAddressToString(settingsSnapshot.dns);
-  page += F("'></label></div><div class='row'><button type='submit'>Save Network</button></div></form></section>");
-
-  page += F("<section><h2>MQTT</h2><form method='post' action='/save/mqtt'>");
-  page += F("<div class='row'><label>Broker URI<input type='text' name='mqtt_uri' value='");
-  page += htmlEscape(settingsSnapshot.mqttBrokerUri);
-  page += F("'></label></div><div class='row'>");
-  page += F("<label>Username<input type='text' name='mqtt_user' value='");
-  page += htmlEscape(settingsSnapshot.mqttUsername);
-  page += F("'></label>");
-  page += F("<label>Password<input type='password' name='mqtt_pass' value='");
-  page += htmlEscape(settingsSnapshot.mqttPassword);
-  page += F("'></label></div><div class='row'><button type='submit'>Save MQTT</button></div></form></section>");
-  page += F("</div>");
-
-  page += F("<div class='grid'>");
-  page += F("<section><h2>Direction Inversion</h2><form method='post' action='/save/invert'>");
-  page += F("<div class='row'><label><input type='checkbox' name='invert1'");
-  page += checkedAttribute(settingsSnapshot.invertDirection[0]);
-  page += F("> Invert Motor 1</label></div>");
-  page += F("<div class='row'><label><input type='checkbox' name='invert2'");
-  page += checkedAttribute(settingsSnapshot.invertDirection[1]);
-  page += F("> Invert Motor 2</label></div>");
-  page += F("<div class='row'><button type='submit'>Save Inversion</button></div></form></section>");
-
-  page += F("<section><h2>Manual Control</h2>");
-  for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
-    float speedPercent = (LightControlConfig::MAX_COMMAND_SPEED_RAD_S > 0.0f)
-                           ? (stateSnapshot.command[motorIndex].speedRadPerSec / LightControlConfig::MAX_COMMAND_SPEED_RAD_S) * 100.0f
-                           : 0.0f;
-    if (speedPercent <= 0.0f) {
-      speedPercent = DEFAULT_MANUAL_SPEED_PERCENT;
-    }
-    page += renderManualForm(MOTOR_TOPICS[motorIndex].displayName, MOTOR_TOPICS[motorIndex].aliases[0], speedPercent);
-  }
-  page += renderManualForm("Both Motors", "all", DEFAULT_MANUAL_SPEED_PERCENT);
-  page += F("</section></div>");
-
-  page += F("<section><h2>Motor State</h2><div class='status'>");
-  for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
-    const int direction = effectiveMotorDirection(stateSnapshot.command[motorIndex], settingsSnapshot.invertDirection[motorIndex]);
-    page += F("<div class='card'><strong>");
-    page += htmlEscape(MOTOR_TOPICS[motorIndex].displayName);
-    page += F("</strong><br>Enabled: ");
-    page += stateSnapshot.command[motorIndex].enabled ? F("yes") : F("no");
-    page += F("<br>Direction: ");
-    page += (direction >= 0) ? F("cw") : F("ccw");
-    page += F("<br>Target Speed: ");
-    page += String(stateSnapshot.command[motorIndex].speedRadPerSec, 2);
-    page += F(" rad/s<br>Current: ");
-    page += String(stateSnapshot.currentVelocity[motorIndex], 2);
-    page += F(" rad/s</div>");
-  }
-  page += F("</div></section>");
-
-  page += F("<section><h2>MQTT Topics</h2><p>Commands stay under <code>");
-  page += htmlEscape(LightControlConfig::MQTT_COMMAND_ROOT);
-  page += F("</code>, for example:</p><p><code>");
-  page += htmlEscape(LightControlConfig::MQTT_COMMAND_ROOT);
-  page += F("/Motor 1/enable</code><br><code>");
-  page += htmlEscape(LightControlConfig::MQTT_COMMAND_ROOT);
-  page += F("/Motor 1/direction</code><br><code>");
-  page += htmlEscape(LightControlConfig::MQTT_COMMAND_ROOT);
-  page += F("/Motor 1/speed</code></p></section>");
-
-  page += F("</body></html>");
-  return page;
-}
-
 void boardInit() {
   pinMode(Pins::MOTOR_1_U, INPUT_PULLUP);
   pinMode(Pins::MOTOR_1_V, INPUT_PULLUP);
@@ -1418,11 +992,16 @@ void boardInit() {
 
   float vin = getVinVolt();
   updateSharedStateVin(vin);
-  while (vin <= LightControlConfig::UNDERVOLTAGE_THRESHOLD_V) {
-    Serial.printf("Waiting for power, VIN=%.2fV\n", vin);
-    delay(500);
-    vin = getVinVolt();
-    updateSharedStateVin(vin);
+
+  RuntimeSettings settings;
+  copyRuntimeSettings(settings);
+  if (settings.underVoltageProtectionEnabled) {
+    while (vin <= LightControlConfig::UNDERVOLTAGE_THRESHOLD_V) {
+      Serial.printf("Waiting for power, VIN=%.2fV\n", vin);
+      delay(500);
+      vin = getVinVolt();
+      updateSharedStateVin(vin);
+    }
   }
 
   Serial.printf("Power ready, VIN=%.2fV\n", vin);
@@ -1431,13 +1010,15 @@ void boardInit() {
 void initMotors() {
   const float supplyVoltage = getVinVolt();
   updateSharedStateVin(supplyVoltage);
+  RuntimeSettings settings;
+  copyRuntimeSettings(settings);
 
   for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
     DRIVERS[motorIndex]->voltage_power_supply = supplyVoltage;
     DRIVERS[motorIndex]->init();
 
     MOTORS[motorIndex]->linkDriver(DRIVERS[motorIndex]);
-    MOTORS[motorIndex]->voltage_limit = LightControlConfig::MOTOR_VOLTAGE_LIMIT_V;
+    MOTORS[motorIndex]->voltage_limit = settings.motorVoltageLimit;
     MOTORS[motorIndex]->velocity_limit = LightControlConfig::MOTOR_VELOCITY_LIMIT_RAD_S;
     MOTORS[motorIndex]->controller = MotionControlType::velocity_openloop;
     MOTORS[motorIndex]->init();
@@ -1479,6 +1060,13 @@ void boardCheck() {
   }
   updateSharedStateVin(vin);
 
+  RuntimeSettings settings;
+  copyRuntimeSettings(settings);
+  if (!settings.underVoltageProtectionEnabled) {
+    updateUnderVoltageState(false);
+    return;
+  }
+
   const bool undervoltage = vin < LightControlConfig::UNDERVOLTAGE_THRESHOLD_V;
   updateUnderVoltageState(undervoltage);
   if (undervoltage) {
@@ -1486,113 +1074,89 @@ void boardCheck() {
   }
 }
 
-void motorTask(void *parameter) {
-  (void)parameter;
-  uint32_t busyLoopCounter = 0;
+void serviceMotorControl() {
+  boardCheck();
 
-  for (;;) {
-    boardCheck();
+  SharedState snapshot;
+  RuntimeSettings settings;
+  float targetVelocity[MOTOR_COUNT] = {0.0f, 0.0f};
+  copySharedState(snapshot);
+  copyRuntimeSettings(settings);
 
-    SharedState snapshot;
-    RuntimeSettings settings;
-    float targetVelocity[MOTOR_COUNT] = {0.0f, 0.0f};
-    copySharedState(snapshot);
-    copyRuntimeSettings(settings);
+  for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
+    MOTORS[motorIndex]->voltage_limit = settings.motorVoltageLimit;
+  }
 
-    bool shouldEnableOutputs = false;
-    for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
-      const MotorCommand &command = snapshot.command[motorIndex];
+  bool shouldEnableOutputs = false;
+  for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
+    const MotorCommand &command = snapshot.command[motorIndex];
 
-      bool commandTimedOut = false;
-      if (LightControlConfig::COMMAND_TIMEOUT_MS > 0 && command.lastUpdateMs > 0) {
-        commandTimedOut = (millis() - command.lastUpdateMs) > LightControlConfig::COMMAND_TIMEOUT_MS;
-      }
-
-      const bool communicationHealthy = snapshot.mqttConnected || !LightControlConfig::STOP_MOTORS_WHEN_MQTT_DISCONNECTS;
-      if (!snapshot.underVoltage && communicationHealthy && !commandTimedOut && command.enabled) {
-        const float direction = static_cast<float>(effectiveMotorDirection(command, settings.invertDirection[motorIndex]));
-        targetVelocity[motorIndex] = direction * command.speedRadPerSec;
-        shouldEnableOutputs = true;
-      }
-
-      if (fabsf(targetVelocity[motorIndex]) > 0.001f) {
-        shouldEnableOutputs = true;
-      }
+    bool commandTimedOut = false;
+    if (LightControlConfig::COMMAND_TIMEOUT_MS > 0 && command.lastUpdateMs > 0) {
+      commandTimedOut = (millis() - command.lastUpdateMs) > LightControlConfig::COMMAND_TIMEOUT_MS;
     }
 
-    updateDriverEnableState(shouldEnableOutputs);
-
-    for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
-      updateSharedCurrentVelocity(motorIndex, targetVelocity[motorIndex]);
-      MOTORS[motorIndex]->move(targetVelocity[motorIndex]);
+    const bool communicationHealthy = snapshot.mqttConnected || !LightControlConfig::STOP_MOTORS_WHEN_MQTT_DISCONNECTS;
+    const bool powerHealthy = !settings.underVoltageProtectionEnabled || !snapshot.underVoltage;
+    if (powerHealthy && communicationHealthy && !commandTimedOut && command.enabled) {
+      const float direction = static_cast<float>(effectiveMotorDirection(command, settings.invertDirection[motorIndex]));
+      targetVelocity[motorIndex] = direction * command.speedRadPerSec;
+      shouldEnableOutputs = true;
     }
 
-    if (!shouldEnableOutputs) {
-      busyLoopCounter = 0;
-      vTaskDelay(pdMS_TO_TICKS(MOTOR_TASK_IDLE_DELAY_MS));
-      continue;
+    if (fabsf(targetVelocity[motorIndex]) > 0.001f) {
+      shouldEnableOutputs = true;
     }
+  }
 
-    ++busyLoopCounter;
-    if (busyLoopCounter >= MOTOR_TASK_BUSY_YIELD_INTERVAL) {
-      busyLoopCounter = 0;
-      vTaskDelay(pdMS_TO_TICKS(MOTOR_TASK_IDLE_DELAY_MS));
-    }
+  updateDriverEnableState(shouldEnableOutputs);
+
+  for (size_t motorIndex = 0; motorIndex < MOTOR_COUNT; ++motorIndex) {
+    updateSharedCurrentVelocity(motorIndex, targetVelocity[motorIndex]);
+    MOTORS[motorIndex]->move(targetVelocity[motorIndex]);
   }
 }
 
-void networkTask(void *parameter) {
-  (void)parameter;
+void serviceNetwork() {
+  serviceWebInterface();
 
-  applyWifiSettings();
-  restartMqttClient();
+  if (wifiReconfigureRequested) {
+    wifiReconfigureRequested = false;
+    applyWifiSettings();
+    lastWifiRetryMs = millis();
+  }
 
-  uint32_t lastWifiRetryMs = 0;
-  uint32_t lastStatusPublishMs = 0;
+  if (mqttReconnectRequested) {
+    mqttReconnectRequested = false;
+    restartMqttClient();
+  }
 
-  for (;;) {
-    webServer.handleClient();
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  updateWifiState(wifiConnected);
 
-    if (wifiReconfigureRequested) {
-      wifiReconfigureRequested = false;
-      applyWifiSettings();
-      lastWifiRetryMs = millis();
+  if (wifiConnected) {
+    wifiConnectStartedMs = millis();
+    if (isFallbackApActive()) {
+      stopFallbackAp();
     }
-
-    if (mqttReconnectRequested) {
-      mqttReconnectRequested = false;
-      restartMqttClient();
-    }
-
-    const bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    updateWifiState(wifiConnected);
-
-    if (wifiConnected) {
-      wifiConnectStartedMs = millis();
-      if (fallbackApActive) {
-        stopFallbackAp();
-      }
-    } else {
-      const uint32_t nowMs = millis();
-      if (nowMs - lastWifiRetryMs >= LightControlConfig::WIFI_RETRY_INTERVAL_MS && LightControlConfig::WIFI_SSID[0] != '\0') {
-        lastWifiRetryMs = nowMs;
-        WiFi.reconnect();
-        Serial.println("[wifi] reconnect requested");
-      }
-
-      if (!fallbackApActive && (nowMs - wifiConnectStartedMs >= LightControlConfig::FALLBACK_AP_DELAY_MS)) {
-        startFallbackAp();
-      }
-    }
-
+  } else {
     const uint32_t nowMs = millis();
-    if (stateDirty || (nowMs - lastStatusPublishMs >= LightControlConfig::STATUS_PUBLISH_INTERVAL_MS)) {
-      publishState();
-      stateDirty = false;
-      lastStatusPublishMs = nowMs;
+    if (nowMs - lastWifiRetryMs >= LightControlConfig::WIFI_RETRY_INTERVAL_MS && LightControlConfig::WIFI_SSID[0] != '\0') {
+      lastWifiRetryMs = nowMs;
+      WiFi.reconnect();
+      Serial.println("[wifi] reconnect requested");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!isFallbackApActive() && (nowMs - wifiConnectStartedMs >= LightControlConfig::FALLBACK_AP_DELAY_MS)) {
+      startFallbackAp();
+    }
+  }
+
+  const uint32_t nowMs = millis();
+  if (stateDirty || (nowMs - lastStatusPublishMs >= LightControlConfig::STATUS_PUBLISH_INTERVAL_MS)) {
+    publishState();
+    stateDirty = false;
+    lastStatusPublishMs = nowMs;
   }
 }
 
@@ -1605,33 +1169,55 @@ void printTopicHelp() {
   Serial.printf("  %s/all/set -> {\"enable\":true,\"direction\":\"cw\",\"speed\":35}\n", LightControlConfig::MQTT_COMMAND_ROOT);
 }
 
-void printWebHelp() {
-  char ssid[64];
-  buildFallbackApSsid(ssid, sizeof(ssid));
-  Serial.println("Web UI:");
-  Serial.println("  STA URL: http://<device-ip>/");
-  Serial.printf("  Fallback AP SSID: %s\n", ssid);
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(250);
+void printStartupBanner() {
   Serial.println();
   Serial.println("ESP32 dual motor MQTT controller");
   Serial.printf("Arduino loop core: %d\n", ARDUINO_RUNNING_CORE);
+}
 
+void initializeApplication() {
   loadRuntimeSettings();
   boardInit();
   initMotors();
   printTopicHelp();
   printWebHelp();
+  applyWifiSettings();
+  restartMqttClient();
+  lastWifiRetryMs = millis();
+  lastStatusPublishMs = millis();
 
-  xTaskCreatePinnedToCore(motorTask, "motorTask", 8192, nullptr, 3, &motorTaskHandle, 1);
-  xTaskCreatePinnedToCore(networkTask, "networkTask", 12288, nullptr, 2, &networkTaskHandle, 0);
+  Serial.println("Single-loop runtime started");
+}
 
-  Serial.println("Tasks started");
+void yieldForMotorLoop() {
+  if (!driverOutputsEnabled) {
+    mainLoopBusyYieldCounter = 0;
+    delay(MOTOR_TASK_IDLE_DELAY_MS);
+    return;
+  }
+
+  ++mainLoopBusyYieldCounter;
+  if (mainLoopBusyYieldCounter >= MOTOR_TASK_BUSY_YIELD_INTERVAL) {
+    mainLoopBusyYieldCounter = 0;
+    delay(0);
+  }
+}
+
+void runApplicationLoop() {
+  serviceMotorControl();
+  serviceNetwork();
+  yieldForMotorLoop();
+}
+
+void setup() {
+  Serial.begin(115200);
+  SimpleFOCDebug::enable(&Serial);
+  delay(250);
+
+  printStartupBanner();
+  initializeApplication();
 }
 
 void loop() {
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  runApplicationLoop();
 }

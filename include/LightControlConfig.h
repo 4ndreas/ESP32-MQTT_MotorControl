@@ -36,8 +36,10 @@ static const char FALLBACK_AP_SSID_PREFIX[] = "mirrorball-setup";
 static const char FALLBACK_AP_PASSWORD[] = "mirrorball-setup";
 static constexpr uint32_t FALLBACK_AP_DELAY_MS = 15000;
 
+static constexpr bool DEFAULT_UNDERVOLTAGE_CHECK_ENABLED = true;
 static constexpr float UNDERVOLTAGE_THRESHOLD_V = 11.1f;
 static constexpr float MOTOR_VOLTAGE_LIMIT_V = 1.5f;
+static constexpr float MAX_MOTOR_VOLTAGE_LIMIT_V = 24.0f;
 static constexpr float MOTOR_VELOCITY_LIMIT_RAD_S = 50.0f;
 static constexpr float MAX_COMMAND_SPEED_RAD_S = 10.0f;
 static constexpr float VELOCITY_RAMP_RAD_S2 = 8.0f;
