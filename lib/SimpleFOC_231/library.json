@@ -1,0 +1,12 @@
+{
+  "name": "Simple FOC",
+  "version": "2.3.1-local",
+  "build": {
+    "srcFilter": [
+      "+<*>",
+      "-<current_sense/hardware_specific/esp32/esp32_adc_driver.cpp>",
+      "-<current_sense/hardware_specific/esp32/esp32_mcu.cpp>",
+      "-<current_sense/hardware_specific/esp32/esp32s_adc_driver.cpp>"
+    ]
+  }
+}
